@@ -13,20 +13,18 @@ using Microsoft.Extensions.Logging;
 
 namespace Durable.Timer.Microservice
 {
-    public static class Function1
+    public static class DurableTimer
     {
         [FunctionName("TimerOrchestrator")]
-        public static async Task<List<string>> TimerOrchestrator(
-            [OrchestrationTrigger] IDurableOrchestrationContext context)
+        public static async Task<bool> TimerOrchestrator(
+            [OrchestrationTrigger] IDurableOrchestrationContext context, ILogger logger)
         {
+            ILogger slog = context.CreateReplaySafeLogger(logger);
+
             string postData = context.GetInput<string>();
 
             TimerObject timerObject = JsonSerializer.Deserialize<TimerObject>(postData);
 
-            int count = 0;
-
-            //while (count < timerObject.MaxUccurrences)
-            //{
             DateTime deadline = context.CurrentUtcDateTime.AddSeconds(timerObject.RetryOptions.DelayMinutes);
 
             await context.CreateTimer(deadline, default);
@@ -39,34 +37,27 @@ namespace Durable.Timer.Microservice
 
             try
             {
+                slog.LogWarning("Trying the call...");
+
                 DurableHttpResponse response = await context.CallHttpAsync(new DurableHttpRequest(HttpMethod.Post, new Uri(timerObject.URL), content: timerObject.Content, httpRetryOptions: ret));
             }
             catch(HttpRequestException ex)
             {
-                var r = 0;
+                slog.LogError("Call failed with a :" + ex.StatusCode);
+
+                return false;
             }
 
-            //    count++;
-            //}
-
-            List<string> outputs = new()
-            {
-                // Replace "hello" with the name of your Durable Activity Function.
-                await context.CallActivityAsync<string>(nameof(SayHello), "Tokyo"),
-                await context.CallActivityAsync<string>(nameof(SayHello), "Seattle"),
-                await context.CallActivityAsync<string>(nameof(SayHello), "London")
-            };
-
             // returns ["Hello Tokyo!", "Hello Seattle!", "Hello London!"]
-            return outputs;
+            return true;
         }
 
-        [FunctionName(nameof(SayHello))]
-        public static string SayHello([ActivityTrigger] string name, ILogger log)
-        {
-            log.LogInformation($"Saying hello to {name}.");
-            return $"Hello {name}!";
-        }
+        //[FunctionName(nameof(SayHello))]
+        //public static string SayHello([ActivityTrigger] string name, ILogger log)
+        //{
+        //    log.LogInformation($"Saying hello to {name}.");
+        //    return $"Hello {name}!";
+        //}
 
         [FunctionName("SetTimer")]
         public static async Task<HttpResponseMessage> HttpStart(
@@ -82,14 +73,14 @@ namespace Durable.Timer.Microservice
                 instanceId = await starter.StartNewAsync("TimerOrchestrator", null, JsonSerializer.Serialize(new TimerObject()
                 {
                     Content = "wappa",
-                    URL = "https://reqbin.com/echo/post/json",
+                    URL = "https://reqbin.com/ecfho/post/json",
                     RetryOptions = new()
                     {
                         BackoffCoefficient = 1,
-                        DelayMinutes = 5,
+                        DelayMinutes = 15,
                         MaxDelayMinutes = 10,
                         TimeOutSeconds = 1000,
-                        MaxRetries = 2
+                        MaxRetries = 4
                     }
                 }));
             }
