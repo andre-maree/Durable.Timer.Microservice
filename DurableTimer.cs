@@ -1,14 +1,10 @@
 using System;
-using System.Collections.Generic;
-using System.Diagnostics.Metrics;
 using System.Net;
 using System.Net.Http;
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.WebJobs;
 using Microsoft.Azure.WebJobs.Extensions.DurableTask;
 using Microsoft.Azure.WebJobs.Extensions.Http;
-using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 
@@ -32,53 +28,49 @@ namespace Durable.Timer.Microservice
 
             (TimerObject timerObject, bool isDurableCheck) = JsonConvert.DeserializeObject<(TimerObject, bool)>(postData);
 
-            int count = 0;
+            int count = 1;
 
             HttpRetryOptions ret = new(TimeSpan.FromSeconds(10), 5)
             {
-                BackoffCoefficient = 1.5,
+                BackoffCoefficient = 1.2,
                 MaxRetryInterval = TimeSpan.FromMinutes(30),
-                RetryTimeout = TimeSpan.FromMinutes(300)
+                //RetryTimeout = TimeSpan.FromMinutes(300)
             };
 
-            DateTime deadline;
+            DateTime deadline = context.CurrentUtcDateTime.AddSeconds(
+                timerObject.RetryOptions.StartDelaySeconds > 0
+                ? timerObject.RetryOptions.StartDelaySeconds
+                : timerObject.RetryOptions.DelaySeconds);
 
-            if (timerObject.RetryOptions.StartDelayMinutes > 0)
+            await context.CreateTimer(deadline, default);
+
+            try
             {
-                deadline = context.CurrentUtcDateTime.AddSeconds(timerObject.RetryOptions.StartDelayMinutes);
+                slog.LogCritical("Executing timer... " + context.CurrentUtcDateTime);
 
-                await context.CreateTimer(deadline, default);
-
-                try
+                if (!await ExecuteTimer(context, timerObject, ret, isDurableCheck))
                 {
-                    slog.LogCritical("Executing timer...");
-
-                    if (!await ExecuteTimer(context, timerObject, ret, isDurableCheck))
-                    {
-                        slog.LogWarning("Timer is done.");
-
-                        return;
-                    }
-                }
-                catch (HttpRequestException ex)
-                {
-                    slog.LogError("Call failed with a :" + ex.StatusCode);
+                    slog.LogWarning("Timer is done.");
 
                     return;
                 }
+            }
+            catch (HttpRequestException ex)
+            {
+                slog.LogError("Call failed with a :" + ex.StatusCode);
 
-                count++;
+                return;
             }
 
             while (count < timerObject.RetryOptions.MaxRetries)
             {
-                deadline = context.CurrentUtcDateTime.AddSeconds(timerObject.RetryOptions.DelayMinutes);
+                deadline = context.CurrentUtcDateTime.AddSeconds(timerObject.RetryOptions.DelaySeconds * Math.Pow(count, timerObject.RetryOptions.BackoffCoefficient));
 
                 await context.CreateTimer(deadline, default);
 
                 try
                 {
-                    slog.LogCritical("Executing timer...");
+                    slog.LogCritical("Executing timer... " + context.CurrentUtcDateTime);
 
                     if (!await ExecuteTimer(context, timerObject, ret, isDurableCheck))
                     {
@@ -89,7 +81,7 @@ namespace Durable.Timer.Microservice
                 }
                 catch (HttpRequestException ex)
                 {
-                    slog.LogError("Call failed with a :" + ex.StatusCode);
+                    slog.LogError("Call failed with: " + ex.StatusCode);
 
                     return;
                 }
@@ -104,9 +96,8 @@ namespace Durable.Timer.Microservice
 
         private static async Task<bool> ExecuteTimer(IDurableOrchestrationContext context, TimerObject timerObject, HttpRetryOptions ret, bool isDurableCheck)
         {
-
             DurableHttpResponse statusResponse = await context.CallHttpAsync(new DurableHttpRequest(HttpMethod.Get, new Uri(timerObject.StatusCheckUrl), asynchronousPatternEnabled: false, httpRetryOptions: ret));
-            
+
             if (statusResponse.StatusCode == HttpStatusCode.Accepted)
             {
                 return true;
@@ -116,112 +107,101 @@ namespace Durable.Timer.Microservice
             {
                 if (statusResponse.StatusCode == HttpStatusCode.OK)
                 {
-                    RuntimeStatus runtimeStatus = JsonConvert.DeserializeObject<RuntimeStatus>(statusResponse.Content);
+                    Status runtimeStatus = JsonConvert.DeserializeObject<Status>(statusResponse.Content);
 
-                    if (runtimeStatus.Equals("Running"))
+                    if (runtimeStatus.RuntimeStatus.Equals("Running"))
                     {
                         await context.CallHttpAsync(new DurableHttpRequest(HttpMethod.Post, new Uri(timerObject.ActionUrl), content: timerObject.Content, httpRetryOptions: ret));
 
                         return true;
                     }
-                    
-                    if(runtimeStatus.Equals("Pending"))
+
+                    if (runtimeStatus.Equals("Pending"))
                     {
                         return true;
                     }
                 }
             }
+            else if (statusResponse.StatusCode == HttpStatusCode.OK)
+            {
+                await context.CallHttpAsync(new DurableHttpRequest(HttpMethod.Post, new Uri(timerObject.ActionUrl), content: timerObject.Content, httpRetryOptions: ret));
+
+                return true;
+            }
 
             return false;
         }
 
-        //[FunctionName("TimerOrchestratorForBoolReturn")]
-        //public static async Task<bool> TimerOrchestratorForBoolReturn(
-        //    [OrchestrationTrigger] IDurableOrchestrationContext context, ILogger logger)
-        //{
-        //    ILogger slog = context.CreateReplaySafeLogger(logger);
-
-        //    string postData = context.GetInput<string>();
-
-        //    TimerObject timerObject = JsonSerializer.Deserialize<TimerObject>(postData);
-
-        //    DateTime deadline = context.CurrentUtcDateTime.AddSeconds(timerObject.RetryOptions.DelayMinutes);
-
-        //    await context.CreateTimer(deadline, default);
-
-        //    try
-        //    {
-        //        slog.LogWarning("Trying the call...");
-
-        //        DurableHttpResponse response = await context.CallHttpAsync(new DurableHttpRequest(HttpMethod.Post, new Uri(timerObject.StatusCheckUrl), content: timerObject.Content, httpRetryOptions: ret));
-        //    }
-        //    catch (HttpRequestException ex)
-        //    {
-        //        slog.LogError("Call failed with a :" + ex.StatusCode);
-
-        //        return false;
-        //    }
-
-        //    return true;
-        //}
-
-        [FunctionName("SetTimer")]
-        public static async Task<HttpResponseMessage> HttpStart(
-            [HttpTrigger(AuthorizationLevel.Anonymous, "post", "get", Route = "SetTimer")
+        [FunctionName("SetTimerForDurableFunctionCheck")]
+        public static async Task<HttpResponseMessage> SetTimerForDurableFunctionCheck(
+            [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "SetTimerForDurableFunctionCheck")
             ] HttpRequestMessage req,
             [DurableClient] IDurableOrchestrationClient starter,
             ILogger log)
         {
-            string instanceId;
+            string instanceId = Guid.NewGuid().ToString();
 
-            if (req.Method == HttpMethod.Get)
-            {
-                instanceId = await starter.StartNewAsync("TimerOrchestrator", null, JsonConvert.SerializeObject((new TimerObject()
-                {
-                    Content = "wappa",
-                    StatusCheckUrl = "http://localhost:7072/runtime/webhooks/durabletask/instances/timer_qwerty?taskHub=TestHubName&connection=Storage&code=p_kRXsa9EfdXgtRn3cH76l1K-cBzsuNIUz6EKHgtwdHDAzFuaoJ8Fw==",
-                    ActionUrl = "https://reqbin.com/ecfho/post/json",
-                    RetryOptions = new()
-                    {
-                        //BackoffCoefficient = 1,
-                        DelayMinutes = 5,
-                        //MaxDelayMinutes = 10,
-                        MaxRetries = 50
-                    }
-                }, true)));
-            }
-            else
-            {
-                // Function input comes from the request content.
-                instanceId = await starter.StartNewAsync("TimerOrchestrator", null, await req.Content.ReadAsStringAsync());
-            }
+            //if (req.Method == HttpMethod.Get)
+            //{
+            //    await starter.StartNewAsync("TimerOrchestrator", instanceId, JsonConvert.SerializeObject((new TimerObject()
+            //    {
+            //        Content = "wappa",
+            //        StatusCheckUrl = "http://localhost:7072/runtime/webhooks/durabletask/instances/timer_qwerty?taskHub=TestHubName&connection=Storage&code=p_kRXsa9EfdXgtRn3cH76l1K-cBzsuNIUz6EKHgtwdHDAzFuaoJ8Fw==",
+            //        ActionUrl = "https://reqbin.com/ecfho/post/json",
+            //        RetryOptions = new()
+            //        {
+            //            StartDelaySeconds = 15,
+            //            BackoffCoefficient = 1.2,
+            //            DelaySeconds = 5,
+            //            MaxDelaySeconds = 100,
+            //            MaxRetries = 1
+            //        }
+            //    }, true)));
+            //}
+            //else
+            //{
+            await starter.StartNewAsync("TimerOrchestrator", instanceId, (await req.Content.ReadAsStringAsync(), true));
+            //}
 
             log.LogInformation($"Started orchestration with ID = '{instanceId}'.");
 
             return starter.CreateCheckStatusResponse(req, instanceId);
         }
-    }
 
-    public class RuntimeStatus
-    {
-        public string runtimeStatus { get; set; }
-    }
+        [FunctionName("SetTimerForApiCallCheck")]
+        public static async Task<HttpResponseMessage> SetTimerForApiCallCheck(
+                [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "SetTimerForApiCallCheck")
+            ] HttpRequestMessage req,
+                [DurableClient] IDurableOrchestrationClient starter,
+                ILogger log)
+        {
+            string instanceId = Guid.NewGuid().ToString();
 
-    public class TimerObject
-    {
-        public RetryOptions RetryOptions { get; set; }
-        public string Content { get; set; }
-        public string StatusCheckUrl { get; set; }
-        public string ActionUrl { get; set; }
-    }
+            //if (req.Method == HttpMethod.Get)
+            //{
+            //    await starter.StartNewAsync("TimerOrchestrator", instanceId, JsonConvert.SerializeObject((new TimerObject()
+            //    {
+            //        Content = "wappa",
+            //        StatusCheckUrl = "http://localhost:7072/runtime/webhooks/durabletask/instances/timer_qwerty?taskHub=TestHubName&connection=Storage&code=p_kRXsa9EfdXgtRn3cH76l1K-cBzsuNIUz6EKHgtwdHDAzFuaoJ8Fw==",
+            //        ActionUrl = "https://reqbin.com/ecfho/post/json",
+            //        RetryOptions = new()
+            //        {
+            //            StartDelaySeconds = 15,
+            //            BackoffCoefficient = 1.2,
+            //            DelaySeconds = 5,
+            //            MaxDelaySeconds = 100,
+            //            MaxRetries = 1
+            //        }
+            //    }, false)));
+            //}
+            //else
+            //{
+                await starter.StartNewAsync("TimerOrchestrator", instanceId, (await req.Content.ReadAsStringAsync(), false));
+            //}
 
-    public class RetryOptions
-    {
-        public int DelayMinutes { get; set; } = 5;
-        //public int MaxDelayMinutes { get; set; } = 25;
-        public int StartDelayMinutes { get; set; }
-        public int MaxRetries { get; set; } = 5;
-        //public double BackoffCoefficient { get; set; } = 1;
-        //public int TimeOutSeconds { get; set; }
+            log.LogInformation($"Started orchestration with ID = '{instanceId}'.");
+
+            return starter.CreateCheckStatusResponse(req, instanceId);
+        }
     }
 }
