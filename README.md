@@ -6,10 +6,14 @@
 - Set a start delay interval and a reccurring interval with an exponential backoff.
 - Built in support for a Durable Function status check.
 
+Note: To easily test this service, use the class OrchestrationStateSimulations.cs in the MicroserviceEmulator.sln which is included in the Microflow repo:
+https://github.com/andre-maree/Microflow/tree/master/MicroserviceEmulator
+
 Example use case:
 
 A Durable Function orchestration has spawned a webhook that is waiting for a human action. Use Durable.Timer.Microservice to check the status (status check URL) of the orchestration and send a reminder (action URL) to the person that an action is needed (orchestration still in running state).
 
+Set timer API:
 ```r
 SetTimerForApiCallCheck: [POST] SetTimerForApiCallCheck
 SetTimerForDurableFunctionCheck: [POST] SetTimerForDurableFunctionCheck
