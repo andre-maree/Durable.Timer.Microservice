@@ -2,7 +2,7 @@
 
 - Set a recurring timer with an API call.
 - Set a status check API URL to check if the timer should complete or continue polling.
-- Set an action API URL for every occurrance that the timer executes.
+- Set an action API URL for every occurrence that the timer executes.
 - Set a start delay interval and a reccurring interval with an exponential backoff.
 - Built in support for a Durable Function status check.
 
